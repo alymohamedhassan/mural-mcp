@@ -1,4 +1,4 @@
-# Arcsen Mural MCP
+# Mural MCP
 
 MCP server for working with [Mural Public API v1](https://developers.mural.co/public/reference/) from MCP-compatible clients (Cursor, Claude Desktop, and other MCP hosts).  
 It supports browsing workspaces and rooms, creating/updating/deleting murals, and creating/updating/deleting mural widgets.
