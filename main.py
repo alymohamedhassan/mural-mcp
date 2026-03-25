@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import os
+import time
 from typing import Any
 
 import httpx
@@ -11,49 +13,92 @@ from mcp.server.fastmcp import FastMCP
 load_dotenv()
 
 BASE_URL = "https://app.mural.co/api/public/v1"
+TOKEN_URL = f"{BASE_URL}/authorization/oauth2/token"
 
 mcp = FastMCP("Mural")
 
 
 class MuralClient:
+    """HTTP client that authenticates via OAuth2 refresh-token grant and
+    automatically refreshes the access token before it expires."""
+
     def __init__(self) -> None:
-        token = os.environ.get("MURAL_API_TOKEN", "")
-        if not token:
-            raise RuntimeError("MURAL_API_TOKEN environment variable is not set")
-        self._headers = {
+        self._client_id = os.environ.get("MURAL_CLIENT_ID", "")
+        self._client_secret = os.environ.get("MURAL_CLIENT_SECRET", "")
+        self._refresh_token = os.environ.get("MURAL_REFRESH_TOKEN", "")
+
+        if not all([self._client_id, self._client_secret, self._refresh_token]):
+            raise RuntimeError(
+                "MURAL_CLIENT_ID, MURAL_CLIENT_SECRET, and MURAL_REFRESH_TOKEN "
+                "must all be set in the environment (see .env.example)"
+            )
+
+        self._access_token: str = ""
+        self._token_expires_at: float = 0.0
+        self._token_lock = asyncio.Lock()
+
+    async def _ensure_token(self) -> str:
+        async with self._token_lock:
+            if self._access_token and time.time() < self._token_expires_at - 60:
+                return self._access_token
+            return await self._refresh_access_token()
+
+    async def _refresh_access_token(self) -> str:
+        async with httpx.AsyncClient(timeout=15.0) as c:
+            r = await c.post(
+                TOKEN_URL,
+                data={
+                    "client_id": self._client_id,
+                    "client_secret": self._client_secret,
+                    "grant_type": "refresh_token",
+                    "refresh_token": self._refresh_token,
+                },
+                headers={"Content-Type": "application/x-www-form-urlencoded"},
+            )
+            r.raise_for_status()
+            data = r.json()
+
+        self._access_token = data["access_token"]
+        expires_in = data.get("expires_in", 3600)
+        self._token_expires_at = time.time() + expires_in
+
+        if "refresh_token" in data:
+            self._refresh_token = data["refresh_token"]
+
+        return self._access_token
+
+    async def _headers(self) -> dict[str, str]:
+        token = await self._ensure_token()
+        return {
             "Authorization": f"Bearer {token}",
             "Content-Type": "application/json",
             "Accept": "application/json",
         }
 
     def _client(self) -> httpx.AsyncClient:
-        return httpx.AsyncClient(
-            base_url=BASE_URL,
-            headers=self._headers,
-            timeout=30.0,
-        )
+        return httpx.AsyncClient(base_url=BASE_URL, timeout=30.0)
 
     async def get(self, path: str, params: dict[str, Any] | None = None) -> dict:
         async with self._client() as c:
-            r = await c.get(path, params=params)
+            r = await c.get(path, params=params, headers=await self._headers())
             r.raise_for_status()
             return r.json()
 
     async def post(self, path: str, body: Any) -> dict:
         async with self._client() as c:
-            r = await c.post(path, json=body)
+            r = await c.post(path, json=body, headers=await self._headers())
             r.raise_for_status()
             return r.json()
 
     async def patch(self, path: str, body: dict) -> dict:
         async with self._client() as c:
-            r = await c.patch(path, json=body)
+            r = await c.patch(path, json=body, headers=await self._headers())
             r.raise_for_status()
             return r.json()
 
     async def delete(self, path: str) -> str:
         async with self._client() as c:
-            r = await c.delete(path)
+            r = await c.delete(path, headers=await self._headers())
             r.raise_for_status()
             if r.status_code == 204 or not r.content:
                 return json.dumps({"status": "deleted"})
